@@ -5,6 +5,8 @@
 ## Usage
 ```powershell
 sudo python3 sniper.py
+sudo python3 sniper.py --log-dir /dir
+sudo python3 sniper.py --format json 
 ```
 
 ## Log Read
@@ -16,8 +18,7 @@ grep curl outbound-dump.log
 grep ":443" outbound-dump.log
 sort outbound-dump.log | awk '{print $4}' | sort | uniq -c | sort -rn | head
 ```
-## Alternative log path
 
+## Features
 ```powershell
-sudo python3 sniper.py --log-dir /yol
 ```
