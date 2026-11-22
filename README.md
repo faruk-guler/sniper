@@ -1,10 +1,6 @@
 # The Sniper of eBPF deep monitoring tool
 <img src="intro/sniper-intro.PNG" alt="INTRO" width="600" height="1000">
 
-- Name Sniper
-- Author: faruk-guler
-- Version: 0.2
-
 ## Requirements
 ```powershell
 Debian:
@@ -68,4 +64,3 @@ sort outbound-dump.log | awk '{print $4}' | sort | uniq -c | sort -rn | head
 - Clearing stale cache entries.
 - Appending hostname information to terminal output records.
 - Disabling hostname analysis using the --no-host flag.
-
