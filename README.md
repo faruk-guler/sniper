@@ -34,35 +34,36 @@ sort outbound-dump.log | awk '{print $4}' | sort | uniq -c | sort -rn | head
 ```
 
 ## Features
-- Giden TCP bağlantılarını izleme (Outbound Monitoring).
-- Gelen TCP bağlantılarını izleme (Inbound Monitoring).
-- IPv4 bağlantılarını izleme.
-- IPv6 bağlantılarını izleme.
-- TCP bağlantı başlangıcını takip etme.
-- TCP bağlantı kabul işlemlerini takip etme.
-- Yerel IP adresini tespit etme.
-- Uzak IP adresini tespit etme.
-- Yerel port bilgisini kaydetme.
-- Uzak port bilgisini kaydetme.
-- Bağlantının yönünü belirleme.
-- Bağlantı zaman damgasını kaydetme.
-- Yerel ve uzak adresleri ayrı ayrı gösterme.
-- Bağlantıyı oluşturan PID bilgisini kaydetme.
-- Process adını kaydetme.
-- Linux kullanıcı adını tespit etme.
-- UID bilgisini kaydetme.
-- Process komut satırını /proc/PID/cmdline üzerinden okuma.
-- Process bilgilerini ağ bağlantılarıyla ilişkilendirme.
-- Gelen bağlantıyı kabul eden yerel sürecin bilgilerini kaydetme.
-- DNS üzerinden hostname tahmini.
-- getaddrinfo() fonksiyonunu izleme.
-- OpenSSL SNI bilgisini yakalama.
-- SSL_set_tlsext_host_name() fonksiyonunu izleme.
-- Hostname bilgisini ilgili PID ile eşleştirme.
-- DNS kaynaklı hostname bilgisini belirtme.
-- SNI kaynaklı hostname bilgisini belirtme.
-- Hostname cache sistemi.
-- 20 saniyelik hostname cache süresi.
-- Eski cache kayıtlarını temizleme.
-- Hostname bilgisini giden bağlantı kayıtlarına ekleme.
-- --no-host ile hostname analizini kapatma.
+- Monitoring outbound TCP connections.
+- Monitoring inbound TCP connections.
+- Monitoring IPv4 connections.
+- Monitoring IPv6 connections.
+- Tracking the initiation of TCP connections.
+- Tracking accepted TCP connections.
+- Detecting the local IP address.
+- Detecting the remote IP address.
+- Recording the local port.
+- Recording the remote port.
+- Determining the direction of the connection.
+- Recording the connection timestamp.
+- Displaying local and remote addresses separately.
+- Recording PID information for the connection.
+- Recording the process name.
+- Detecting the Linux username.
+- Recording UID information.
+- Reading the process command line via /proc/PID/cmdline.
+- Associating processes with network connections.
+- Recording local processes that do not accept incoming data.
+- Resolving hostnames via DNS.
+- Monitoring the getaddrinfo() function.
+- Collecting OpenSSL SNI information.
+- Monitoring the SSL_set_tlsext_host_name() function.
+- Mapping hostname information to PIDs.
+- Recording hostname information obtained from DNS.
+- Recording hostname information from SNI data.
+- Hostname caching system.
+- 20-second hostname cache duration.
+- Clearing stale cache entries.
+- Appending hostname information to terminal output records.
+- Disabling hostname analysis using the --no-host flag.
+
