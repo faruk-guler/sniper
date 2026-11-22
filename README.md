@@ -1,5 +1,7 @@
 # The sniper eBPF deep monitoring tool
 
+<img src="intro/sniper-intro.PNG" alt="INTRO" width="350" height="500">
+
 ## Usage
 ```powershell
 sudo python3 sniper.py
