@@ -25,7 +25,7 @@ sudo python3 sniper.py --no-cmd
 sudo nohup python3 sniper.py
 ```
 
-## Log Read
+## Log Reading
 ```powershell
 tail -f outbound-dump.log
 tail -f inbound-dump.log
