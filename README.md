@@ -1,4 +1,9 @@
-# the sniper eBPF deep monitoring tool
+# The sniper eBPF deep monitoring tool
+
+## Usage
+```powershell
+sudo python3 sniper.py
+```
 
 ## Log Read
 
