@@ -1,4 +1,4 @@
-# fast sniper
+# fast sniper commands
 
 # Linux
 ```powershell
