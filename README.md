@@ -2,6 +2,12 @@
 
 <img src="intro/sniper-intro.PNG" alt="INTRO" width="600" height="1000">
 
+## Requirements
+```powershell
+sudo apt update
+sudo apt install -y python3-bpfcc bpfcc-tools linux-headers-$(uname -r)
+```
+
 ## Usage
 ```powershell
 sudo python3 sniper.py
