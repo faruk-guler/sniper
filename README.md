@@ -4,8 +4,13 @@
 
 ## Requirements
 ```powershell
+Debian:
 sudo apt update
 sudo apt install -y python3-bpfcc bpfcc-tools linux-headers-$(uname -r)
+
+RHEL:
+sudo dnf update
+sudo dnf install -y bcc-tools python3-bcc kernel-devel-$(uname -r)
 ```
 
 ## Usage
