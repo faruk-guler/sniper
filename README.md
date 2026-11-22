@@ -1,7 +1,9 @@
 # The Sniper of eBPF deep monitoring tool
-Version: 0.2
-
 <img src="intro/sniper-intro.PNG" alt="INTRO" width="600" height="1000">
+
+- Name Sniper
+- Author: faruk-guler
+- Version: 0.2
 
 ## Requirements
 ```powershell
