@@ -21,5 +21,35 @@ sort outbound-dump.log | awk '{print $4}' | sort | uniq -c | sort -rn | head
 ```
 
 ## Features
-```powershell
-```
+- Giden TCP bağlantılarını izleme (Outbound Monitoring).
+- Gelen TCP bağlantılarını izleme (Inbound Monitoring).
+- IPv4 bağlantılarını izleme.
+- IPv6 bağlantılarını izleme.
+- TCP bağlantı başlangıcını takip etme.
+- TCP bağlantı kabul işlemlerini takip etme.
+- Yerel IP adresini tespit etme.
+- Uzak IP adresini tespit etme.
+- Yerel port bilgisini kaydetme.
+- Uzak port bilgisini kaydetme.
+- Bağlantının yönünü belirleme.
+- Bağlantı zaman damgasını kaydetme.
+- Yerel ve uzak adresleri ayrı ayrı gösterme.
+- Bağlantıyı oluşturan PID bilgisini kaydetme.
+- Process adını kaydetme.
+- Linux kullanıcı adını tespit etme.
+- UID bilgisini kaydetme.
+- Process komut satırını /proc/PID/cmdline üzerinden okuma.
+- Process bilgilerini ağ bağlantılarıyla ilişkilendirme.
+- Gelen bağlantıyı kabul eden yerel sürecin bilgilerini kaydetme.
+- DNS üzerinden hostname tahmini.
+- getaddrinfo() fonksiyonunu izleme.
+- OpenSSL SNI bilgisini yakalama.
+- SSL_set_tlsext_host_name() fonksiyonunu izleme.
+- Hostname bilgisini ilgili PID ile eşleştirme.
+- DNS kaynaklı hostname bilgisini belirtme.
+- SNI kaynaklı hostname bilgisini belirtme.
+- Hostname cache sistemi.
+- 20 saniyelik hostname cache süresi.
+- Eski cache kayıtlarını temizleme.
+- Hostname bilgisini giden bağlantı kayıtlarına ekleme.
+- --no-host ile hostname analizini kapatma.
