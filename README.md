@@ -20,10 +20,10 @@ sudo dnf install -y bcc-tools python3-bcc kernel-devel-$(uname -r)
 ```powershell
 sudo python3 sniper.py
 sudo python3 sniper.py --log-loopback
-sudo python3 sniper.py --log-dir /dir
 sudo python3 sniper.py --format json
 sudo python3 sniper.py --no-cmd
 sudo nohup python3 sniper.py
+sudo python3 sniper.py --log-dir /dir
 ```
 
 ## Log Reading
