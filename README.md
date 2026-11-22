@@ -1,4 +1,4 @@
-# The Sniper of eBPF deep monitoring tool
+# The Sniper of eBPF deep monitoring tool (v.02)
 
 <img src="intro/sniper-intro.PNG" alt="INTRO" width="600" height="1000">
 
