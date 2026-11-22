@@ -1,1 +1,1 @@
-# the sniper eBPF monitoring tool
+# the sniper eBPF deep monitoring tool
