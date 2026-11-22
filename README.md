@@ -1,1 +1,1 @@
-# the sniper
+# the sniper eBPF monitoring tool
