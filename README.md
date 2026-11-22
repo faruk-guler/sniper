@@ -22,6 +22,7 @@ sudo python3 sniper.py
 sudo python3 sniper.py --log-dir /dir
 sudo python3 sniper.py --format json
 sudo python3 sniper.py --no-cmd
+sudo nohup python3 sniper.py
 ```
 
 ## Log Read
