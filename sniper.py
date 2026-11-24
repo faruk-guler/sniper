@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sniper v0.5: monitor-only. Giden/gelen TCP baglantilarini loglar, engellemez.
+"""Sniper v0.6: monitor-only. Giden/gelen TCP ile UDP/DNS baglantilarini loglar, engellemez.
 
 Calistirmak icin:  sudo python3 sniper.py
 Durdurmak icin:    Ctrl+C
@@ -15,6 +15,23 @@ Kayit turleri (event):
   close     baglanti kapandi: sure, bayt (tx/rx) ve sonuc (ok | failed)
   snapshot  Sniper basladiginda zaten acik olan baglanti (yon tahminidir)
   repeat    --dedupe ile bastirilan tekrarlarin ozeti (count alani)
+  dns       DNS sorgusu+yaniti tek kayit: ad, tur, rcode, cevaplar, gecikme (proto=udp)
+  (UDP akislari 'open' kaydidir ve proto=udp tasir; UDP icin close kaydi yoktur.)
+
+v0.6 yenilikleri:
+  * UDP: udp_sendmsg/udpv6_sendmsg ile GIDEN UDP akislari (proto=udp). Cekirdekte (soket,hedef)
+    basina --udp-window sn'de en fazla bir kayit (varsayilan 30; DNS portu icin 1 sn).
+    UDP icin yalnizca gonderim gorulur: gelen UDP ve yanit akislari izlenmez.
+  * DNS: AF_PACKET + klasik BPF suzgeciyle 53/udp sorgu ve yanitlari ayristirilir (surec bilgisi
+    UDP akis olayindan eslenir). Yalnizca bu makinenin ucu oldugu trafik: kendi sorgularin
+    (outbound) ve bu makinenin cozucu/sunucu oldugu sorgular (inbound; surec bilinmez).
+    DNS-over-TCP/TLS/HTTPS, mDNS ve 53 disi portlar gorulmez; IP parcalanmis buyuk yanitlar eksik
+    ayristirilabilir. systemd-resolved varsa hem uygulama->127.0.0.53 hem cozucu->yukari akis
+    ayri kayit olarak gorunur.
+  * host_guess artik DNS yanitlarindan da beslenir: sni > dns-resp (surec+IP eslesmesi) >
+    dns (getaddrinfo) > dns-ip (yalniz IP eslesmesi).
+  * Olaylar (BPF + DNS paketleri) olay zamanina gore siralanip ~0.3 sn gecikmeyle islenir.
+  * Yeni bayraklar: --no-udp, --no-dns, --udp-window.
 
 v0.5 yenilikleri:
   * Yasam dongusu: close kayitlari (sure, bayt, sonuc). Gelen baglantilarda sure
@@ -35,7 +52,7 @@ Kural dosyasi (JSON, ilk eslesen kazanir; bir kuraldaki tum alanlar VE, listeler
       {"action": "ignore", "direction": "outbound", "remote_cidr": ["10.0.0.0/8"], "port": ["53"]}
     ]
   }
-  Alanlar: action(log|ignore) direction(out|in) uid comm exe user unit container host
+  Alanlar: action(log|ignore) direction(out|in) uid comm exe user unit container host proto event
            (fnmatch desenleri) port remote_port local_port (sayi veya "a-b")
            remote_cidr local_cidr. "port" hizmet tarafidir (giden: uzak, gelen: yerel).
 
@@ -47,9 +64,13 @@ Notlar:
     yanlis eslesebilir. Kendi TLS kutuphanesini gomen programlar (Go, Node,
     Chrome...) SNI kapsaminda degildir.
   * Komut satiri varsayilan olarak KAPALIDIR (parola icerebilir); --cmd ile acilir.
-  * v0.5 ile CSV/JSON semasi genisledi (event, ppid, exe, unit, container,
-    duration_ms, bytes_tx, bytes_rx, outcome, count). v0.4'ten: remote_host ->
-    host_guess, remote_host_source -> host_guess_source.
+  * Sema genisledi: v0.5 (event, ppid, exe, unit, container, duration_ms, bytes_tx, bytes_rx,
+    outcome, count), v0.6 (proto, dns_name, dns_type, dns_rcode, dns_answers, dns_ms, dns_tc).
+    v0.4'ten: remote_host -> host_guess, remote_host_source -> host_guess_source.
+  * DNS kayitlarinda 'host' kurali dns_name'e uygulanir; DNS kayitlari --log-loopback/--ignore-private
+    suzgeclerinden etkilenmez (cozucu genelde yerel/ozeldir); suzmek icin kurallari kullan.
+  * 'host' bos ve pid=0 olan DNS kaydi: cozumleyen surec belirlenemedi (inbound, ya da UDP akis
+    olayi yakalanamadi).
 """
 import os
 import re
@@ -62,6 +83,9 @@ import time
 import signal
 import socket
 import fnmatch
+import heapq
+import struct
+import ctypes as ct
 import logging
 import logging.handlers
 import argparse
@@ -70,7 +94,7 @@ import subprocess
 from collections import OrderedDict
 from datetime import datetime, timezone
 
-VERSION = "0.5"
+VERSION = "0.6"
 
 
 def warn(msg):
@@ -116,6 +140,13 @@ parser.add_argument("--no-bytes", action="store_true",
                     help="Kapanis kaydinda bayt sayaclarini okuma (eski cekirdekler icin)")
 parser.add_argument("--no-snapshot", action="store_true",
                     help="Baslangicta acik baglantilarin anlik goruntusunu alma")
+parser.add_argument("--no-udp", action="store_true",
+                    help="Giden UDP akislarini (udp_sendmsg) izleme")
+parser.add_argument("--no-dns", action="store_true",
+                    help="DNS (53/udp) paket yakalama ve ayristirmayi kapat")
+parser.add_argument("--udp-window", type=float, default=30.0, metavar="SN",
+                    help="Ayni (soket, hedef) UDP akisi icin kayitlar arasi en az sure, sn "
+                         "(varsayilan 30; 0 = her gonderim, cok kayit uretir)")
 parser.add_argument("--no-enrich", action="store_true",
                     help="ppid/exe/unit/container zenginlestirmesini kapat (daha az /proc okuma)")
 parser.add_argument("--config", metavar="DOSYA",
@@ -147,6 +178,8 @@ if ARGS.perf_pages < 1 or (ARGS.perf_pages & (ARGS.perf_pages - 1)):
     parser.error("--perf-pages 2'nin kuvveti olmali (ornek: 8, 16, 64, 128)")
 if ARGS.dedupe < 0:
     parser.error("--dedupe negatif olamaz")
+if ARGS.udp_window < 0:
+    parser.error("--udp-window negatif olamaz")
 # Komut satiri yalnizca --cmd verildiyse ve --no-cmd verilmediyse acik.
 ARGS.no_cmd = ARGS.no_cmd or not ARGS.cmd
 
@@ -181,6 +214,8 @@ os.umask(0o027)
 b = None                 # BPF nesnesi (main'de olusur)
 LIFECYCLE_ON = False     # close kayitlari gercekten uretiliyor mu (derleme sonucu)
 BYTES_ON = False         # bayt sayaclari okunuyor mu (derleme sonucu)
+UDP_ON = False           # UDP kprobe'lari baglandi mi
+DNS_ON = False           # DNS paket yakalama calisiyor mu
 
 HOST_CACHE = {}
 HOST_TTL = 20
@@ -204,11 +239,12 @@ def sanitize(value):
 # ------------------------------------------------------------------ CSV sabitleri
 CSV_DELIM = "\t" if ARGS.csv_delimiter == "tab" else ARGS.csv_delimiter
 CSV_COLUMNS = [
-    "ts", "hostname", "event", "direction", "uid", "user", "pid", "ppid", "comm",
+    "ts", "hostname", "event", "proto", "direction", "uid", "user", "pid", "ppid", "comm",
     "exe", "unit", "container",
     "family", "local_ip", "local_port", "remote_ip", "remote_port",
     "host_guess", "host_guess_source",
     "duration_ms", "bytes_tx", "bytes_rx", "outcome", "count",
+    "dns_name", "dns_type", "dns_rcode", "dns_answers", "dns_ms", "dns_tc",
 ]
 if not ARGS.no_cmd:
     CSV_COLUMNS.append("cmdline")
@@ -313,6 +349,27 @@ def _path_str(direction, rec):
     return f"{local} -> {remote}" if direction == "outbound" else f"{remote} -> {local}"
 
 
+def _who(rec):
+    if rec.get("pid"):
+        return f'{rec["comm"]}[{rec["pid"]}] {rec["user"]}'
+    return rec.get("comm") or "-"
+
+
+def _tail(rec):
+    s = ""
+    if rec.get("ppid") is not None:
+        s += f' ppid={rec["ppid"]}'
+    if rec.get("exe"):
+        s += f' exe={json.dumps(rec["exe"], ensure_ascii=False)}'
+    if rec.get("unit"):
+        s += f' unit={rec["unit"]}'
+    if rec.get("container"):
+        s += f' ctr={rec["container"]}'
+    if not ARGS.no_cmd and rec.get("cmdline"):
+        s += f' cmd={json.dumps(rec["cmdline"], ensure_ascii=False)}'
+    return s
+
+
 def format_record(direction, rec):
     out = dict(rec)
     out["direction"] = direction
@@ -323,32 +380,44 @@ def format_record(direction, rec):
         return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
 
     if ARGS.format == "csv":
+        if isinstance(out.get("dns_answers"), list):
+            out["dns_answers"] = " ".join(out["dns_answers"])
+        if "dns_tc" in out:
+            out["dns_tc"] = int(bool(out["dns_tc"]))
         return _csv_line([csv_cell(out.get(col)) for col in CSV_COLUMNS])
 
     # text (varsayilan) -- tum degiskenler kayit olusturulurken sanitize edildi
     evt = rec.get("event", "open")
-    dlabel = "OUT" if direction == "outbound" else "IN"
-    head = f"{dlabel:<3}" if evt == "open" else f"{dlabel}-{evt.upper()}"
-    who = f'{rec["comm"]}[{rec["pid"]}] {rec["user"]}'
-    line = f'{local_time(rec["ts"])} {head} {who} {_path_str(direction, rec)}'
-    if direction == "outbound" and rec.get("host_guess"):
-        line += f' host_guess={rec["host_guess"]}({rec["host_guess_source"]})'
-    if evt == "close":
-        line += (f' dur={human_dur(rec.get("duration_ms"))} tx={human_bytes(rec.get("bytes_tx"))}'
-                 f' rx={human_bytes(rec.get("bytes_rx"))} outcome={rec.get("outcome")}')
-    elif evt == "repeat":
-        line += f' repeated={rec.get("count")}'
-    if rec.get("ppid") is not None:
-        line += f' ppid={rec["ppid"]}'
-    if rec.get("exe"):
-        line += f' exe={json.dumps(rec["exe"], ensure_ascii=False)}'
-    if rec.get("unit"):
-        line += f' unit={rec["unit"]}'
-    if rec.get("container"):
-        line += f' ctr={rec["container"]}'
-    if not ARGS.no_cmd and rec.get("cmdline"):
-        line += f' cmd={json.dumps(rec["cmdline"], ensure_ascii=False)}'
-    return line
+    out_dir = direction == "outbound"
+    udp = rec.get("proto") == "udp"
+    if evt == "dns":
+        head = "DNS" if out_dir else "DNS-IN"
+    elif evt == "open":
+        head = ("OUT-UDP" if out_dir else "IN-UDP") if udp else ("OUT" if out_dir else "IN ")
+    else:
+        head = f'{"OUT" if out_dir else "IN"}-{evt.upper()}'
+    line = f'{local_time(rec["ts"])} {head} {_who(rec)} {_path_str(direction, rec)}'
+    if evt == "dns":
+        ans = ",".join(rec.get("dns_answers") or [])
+        line += f' {rec.get("dns_type")} {rec.get("dns_name")}'
+        if ans:
+            line += f' => {ans}'
+        line += f' rcode={rec.get("dns_rcode")}'
+        if rec.get("dns_ms") is not None:
+            line += f' time={human_dur(rec["dns_ms"])}'
+        if rec.get("dns_tc"):
+            line += " tc"
+    else:
+        if out_dir and rec.get("host_guess"):
+            line += f' host_guess={rec["host_guess"]}({rec["host_guess_source"]})'
+        if evt == "close":
+            line += (f' dur={human_dur(rec.get("duration_ms"))} tx={human_bytes(rec.get("bytes_tx"))}'
+                     f' rx={human_bytes(rec.get("bytes_rx"))} outcome={rec.get("outcome")}')
+        elif evt == "repeat":
+            line += f' repeated={rec.get("count")}'
+            if rec.get("dns_name"):
+                line += f' {rec.get("dns_type")} {rec.get("dns_name")}'
+    return line + _tail(rec)
 
 
 def store(direction, rec):
@@ -380,7 +449,7 @@ def _parse_ports(v):
     return out
 
 
-_TEXT_FIELDS = ("comm", "exe", "user", "unit", "container", "host")
+_TEXT_FIELDS = ("comm", "exe", "user", "unit", "container", "host", "proto", "event")
 _PORT_FIELDS = ("port", "remote_port", "local_port")
 _CIDR_FIELDS = ("remote_cidr", "local_cidr")
 _RULE_KEYS = {"action", "direction", "uid"} | set(_TEXT_FIELDS) | set(_PORT_FIELDS) | set(_CIDR_FIELDS)
@@ -417,7 +486,10 @@ class Rule:
         if self.uids is not None and rec["uid"] not in self.uids:
             return False
         for key, patterns in self.text.items():
-            val = rec.get("host_guess" if key == "host" else key) or ""
+            if key == "host":
+                val = (rec.get("dns_name") if rec.get("event") == "dns" else rec.get("host_guess")) or ""
+            else:
+                val = rec.get(key) or ""
             if not any(fnmatch.fnmatchcase(val, p) for p in patterns):
                 return False
         for key, ranges in self.ports.items():
@@ -839,6 +911,138 @@ TRACEPOINT_PROBE(sock, inet_sock_set_state) {
 }
 #endif
 
+#ifndef NO_UDP
+/* ---------------- GIDEN UDP (udp_sendmsg / udpv6_sendmsg) ----------------
+   msghdr'in ilk alani msg_name'dir; sockaddr_in: family@0 port@2 addr@4,
+   sockaddr_in6: family@0 port@2 addr@8. Yalnizca ilk gonderim (pencere) kaydedilir.
+   AF_INET6 soketten v4-mapped/AF_INET hedefe gonderim cekirdekte udp_sendmsg'e duser;
+   v6 probe bunlari atlar, boylece cift kayit olusmaz. */
+#ifndef UDP_WINDOW_NS
+#define UDP_WINDOW_NS 30000000000ULL
+#endif
+#ifndef UDP_DNS_WINDOW_NS
+#define UDP_DNS_WINDOW_NS 1000000000ULL
+#endif
+
+struct udp_pend_t {
+    u64 t0_ns;
+    u64 sk;
+    u32 daddr[4];
+    u16 dport;      // ag bayt sirasi
+    u16 family;     // 2 | 10
+};
+
+struct udp_key_t {
+    u64 sk;
+    u32 daddr[4];
+    u16 dport;
+    u16 pad0;
+    u32 pad1;
+};
+
+struct udp_event_t {
+    u64 ts_us;
+    u32 pid;
+    u32 uid;
+    u32 saddr[4];
+    u32 daddr[4];
+    u16 sport;
+    u16 dport;
+    u16 family;
+    u16 pad;
+    char comm[TASK_COMM_LEN];
+};
+
+BPF_HASH(udp_pending, u64, struct udp_pend_t);
+BPF_TABLE("lru_hash", struct udp_key_t, u64, udp_seen, 32768);
+BPF_PERF_OUTPUT(udp_events);
+
+int trace_udp_sendmsg(struct pt_regs *ctx, struct sock *sk, void *msg) {
+    struct udp_pend_t p = {};
+    void *name = NULL;
+    bpf_probe_read_kernel(&name, sizeof(name), msg);
+    if (name != NULL) {
+        u16 fam = 0;
+        bpf_probe_read_kernel(&fam, sizeof(fam), name);
+        if (fam != 2) return 0;
+        bpf_probe_read_kernel(&p.dport, sizeof(p.dport), (char *)name + 2);
+        bpf_probe_read_kernel(&p.daddr[0], 4, (char *)name + 4);
+    } else {
+        bpf_probe_read_kernel(&p.dport, sizeof(p.dport), &sk->__sk_common.skc_dport);
+        bpf_probe_read_kernel(&p.daddr[0], 4, &sk->__sk_common.skc_daddr);
+    }
+    if (p.daddr[0] == 0 || p.dport == 0) return 0;
+    p.family = 2;
+    p.sk = (u64)sk;
+    p.t0_ns = bpf_ktime_get_ns();
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    udp_pending.update(&pid_tgid, &p);
+    return 0;
+}
+
+int trace_udpv6_sendmsg(struct pt_regs *ctx, struct sock *sk, void *msg) {
+    struct udp_pend_t p = {};
+    void *name = NULL;
+    bpf_probe_read_kernel(&name, sizeof(name), msg);
+    if (name != NULL) {
+        u16 fam = 0;
+        bpf_probe_read_kernel(&fam, sizeof(fam), name);
+        if (fam != 10) return 0;
+        bpf_probe_read_kernel(&p.dport, sizeof(p.dport), (char *)name + 2);
+        bpf_probe_read_kernel(&p.daddr, sizeof(p.daddr), (char *)name + 8);
+    } else {
+        bpf_probe_read_kernel(&p.dport, sizeof(p.dport), &sk->__sk_common.skc_dport);
+        bpf_probe_read_kernel(&p.daddr, sizeof(p.daddr), sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+    }
+    if (IS_V4MAPPED(p.daddr)) return 0;
+    if ((p.daddr[0] | p.daddr[1] | p.daddr[2] | p.daddr[3]) == 0 || p.dport == 0) return 0;
+    p.family = 10;
+    p.sk = (u64)sk;
+    p.t0_ns = bpf_ktime_get_ns();
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    udp_pending.update(&pid_tgid, &p);
+    return 0;
+}
+
+int trace_udp_sendmsg_ret(struct pt_regs *ctx) {
+    int ret = PT_REGS_RC(ctx);
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct udp_pend_t *pp = udp_pending.lookup(&pid_tgid);
+    if (pp == 0) return 0;
+    struct udp_pend_t p = *pp;
+    udp_pending.delete(&pid_tgid);
+    if (ret < 0) return 0;
+
+    u64 now = bpf_ktime_get_ns();
+    struct udp_key_t k = {};
+    k.sk = p.sk;
+    COPY6(k.daddr, p.daddr);
+    k.dport = p.dport;
+    u64 window = (ntohs(p.dport) == 53) ? UDP_DNS_WINDOW_NS : UDP_WINDOW_NS;
+    u64 *last = udp_seen.lookup(&k);
+    if (last != 0 && now - *last < window) return 0;
+    udp_seen.update(&k, &now);
+
+    struct sock *sk = (struct sock *)p.sk;
+    struct udp_event_t evt = {};
+    evt.ts_us = p.t0_ns / 1000;      // gonderim BASLANGICI: ayni paketin yakalama zamanindan once
+    evt.pid = pid_tgid >> 32;
+    evt.uid = bpf_get_current_uid_gid();
+    if (p.family == 2) {
+        bpf_probe_read_kernel(&evt.saddr[0], 4, &sk->__sk_common.skc_rcv_saddr);
+    } else {
+        bpf_probe_read_kernel(&evt.saddr, sizeof(evt.saddr), sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+    }
+    COPY6(evt.daddr, p.daddr);
+    bpf_probe_read_kernel(&evt.sport, sizeof(evt.sport), &sk->__sk_common.skc_num);
+    evt.dport = ntohs(p.dport);
+    evt.family = p.family;
+    bpf_get_current_comm(&evt.comm, sizeof(evt.comm));
+    udp_events.perf_submit(ctx, &evt, sizeof(evt));
+    return 0;
+}
+#endif
+
 /* ---------------- Alan adi tahmini ---------------- */
 int trace_getaddrinfo(struct pt_regs *ctx, const char __user *node) {
     if (node == NULL) return 0;
@@ -889,6 +1093,8 @@ def ip6_to_str(raw):
 
 
 def get_username(uid):
+    if uid is None:
+        return ""
     name = _UID_CACHE.get(uid)
     if name is not None:
         return name
@@ -1065,10 +1271,17 @@ def get_proc_info(pid):
 
 
 # ------------------------------------------------------------- alan adi tahmini
+# Bu bolumde zaman damgalari DUVAR SAATI saniyesidir (olay zamani).
+DNS_MAP_TTL = 300.0
+DNS_MAP_MAX = 50000
+HOST_BY_IP = OrderedDict()        # ip metni -> (ad, zaman)
+HOST_BY_PID_IP = OrderedDict()    # (pid, ip metni) -> (ad, zaman)
+
+
 def cleanup_host_cache():
     """Her olayda degil, en fazla saniyede bir calisir (O(n) tarama maliyeti icin)."""
     global _HOST_GC_LAST
-    now = time.monotonic()
+    now = time.time()
     if now - _HOST_GC_LAST < 1.0:
         return
     _HOST_GC_LAST = now
@@ -1077,6 +1290,9 @@ def cleanup_host_cache():
     if len(HOST_CACHE) > 10000:      # ani PID patlamasina karsi sert limit
         for pid, _ in sorted(HOST_CACHE.items(), key=lambda kv: kv[1]["ts"])[:2000]:
             HOST_CACHE.pop(pid, None)
+    for od in (HOST_BY_IP, HOST_BY_PID_IP):
+        while od and (len(od) > DNS_MAP_MAX or now - next(iter(od.values()))[1] > DNS_MAP_TTL):
+            od.popitem(last=False)
 
 
 def remember_host(pid, host, source, ts_s):
@@ -1089,19 +1305,52 @@ def remember_host(pid, host, source, ts_s):
     HOST_CACHE[pid] = {"host": host, "source": source, "ts": ts_s}
 
 
-def get_host_for_pid(pid, now_s):
+def remember_dns_answer(pid, ip, name, ts_s):
+    """DNS yanitindaki bir A/AAAA adresini, sorulan adla eslestirir."""
+    if not ENABLE_HOST_ENRICHMENT or not _HOST_RE.fullmatch(name or ""):
+        return
+    HOST_BY_IP[ip] = (name, ts_s)
+    HOST_BY_IP.move_to_end(ip)
+    if pid:
+        HOST_BY_PID_IP[(pid, ip)] = (name, ts_s)
+        HOST_BY_PID_IP.move_to_end((pid, ip))
+
+
+def resolve_host(pid, rip, now_s):
+    """Uzak IP icin (ad, kaynak). Oncelik: sni > dns-resp > dns > dns-ip. Hepsi TAHMINDIR."""
+    if not ENABLE_HOST_ENRICHMENT:
+        return None, None
     cleanup_host_cache()
     item = HOST_CACHE.get(pid)
-    if item is not None and now_s - item["ts"] <= HOST_TTL:
+    fresh = item is not None and now_s - item["ts"] <= HOST_TTL
+    if fresh and item["source"] == "sni":
+        return item["host"], "sni"
+    e = HOST_BY_PID_IP.get((pid, rip))
+    if e is not None and now_s - e[1] <= DNS_MAP_TTL:
+        return e[0], "dns-resp"
+    if fresh:
         return item["host"], item["source"]
+    e = HOST_BY_IP.get(rip)
+    if e is not None and now_s - e[1] <= DNS_MAP_TTL:
+        return e[0], "dns-ip"
     return None, None
 
 
 # ------------------------------------------------------------- karar: kaydet / atla / bastir
+def is_unspecified(ip):
+    try:
+        return ipaddress.ip_address(ip).is_unspecified
+    except Exception:
+        return False
+
+
 def should_skip(direction, rec):
     if IGNORE_ROOT and rec["uid"] == 0:
         return True
-    if IGNORE_LOOPBACK and is_loopback(rec["local_ip"]) and is_loopback(rec["remote_ip"]):
+    if rec.get("event") == "dns":
+        return False      # DNS kayitlari loopback/ozel-IP suzgeclerinden etkilenmez (cozucu genelde yerel/ozeldir)
+    if (IGNORE_LOOPBACK and is_loopback(rec["remote_ip"])
+            and (is_loopback(rec["local_ip"]) or is_unspecified(rec["local_ip"]))):
         return True
     if direction == "outbound" and IGNORE_PRIVATE_OUT and is_private(rec["remote_ip"]):
         return True
@@ -1131,7 +1380,8 @@ def dedupe_hit(direction, rec, now_s):
     win = ARGS.dedupe
     if win <= 0:
         return False
-    key = (direction, rec["pid"], rec["comm"], rec["remote_ip"], service_port(direction, rec))
+    key = (direction, rec["pid"], rec["comm"], rec.get("proto"), rec["remote_ip"],
+           service_port(direction, rec), rec.get("dns_name", ""), rec.get("dns_type", ""))
     ent = DEDUPE.get(key)
     if ent is not None:
         if now_s - ent["first"] < win:
@@ -1146,7 +1396,7 @@ def dedupe_hit(direction, rec, now_s):
 
 
 def flush_dedupe(now_s=None, force=False):
-    now_s = time.monotonic() if now_s is None else now_s
+    now_s = time.time() if now_s is None else now_s
     for key in list(DEDUPE):
         ent = DEDUPE[key]
         if force or now_s - ent["first"] >= ARGS.dedupe:
@@ -1182,8 +1432,9 @@ def track_put(sk, decision, host, src, info):
 # ------------------------------------------------------------- canli cikti
 LIVE = not ARGS.quiet
 COLOR = sys.stdout.isatty() and not ARGS.no_color
-C_OUT, C_IN, C_DIM, C_RESET, C_RED = (
-    ("\033[36m", "\033[33m", "\033[2m", "\033[0m", "\033[31m") if COLOR else ("", "", "", "", ""))
+C_OUT, C_IN, C_DIM, C_RESET, C_RED, C_DNS = (
+    ("\033[36m", "\033[33m", "\033[2m", "\033[0m", "\033[31m", "\033[35m") if COLOR
+    else ("", "", "", "", "", ""))
 
 BANNER = r"""
 ▄▄▄▄▄▄▄▄   ▄▄▄▄    ▄▄▄▄▄  ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄▄▄   ▄▄▄▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄▄
@@ -1219,14 +1470,27 @@ def live_print(direction, rec):
     if evt == "snapshot":
         return
     t = datetime.now().strftime("%H:%M:%S")
-    who = f'{rec["comm"]}[{rec["pid"]}] {rec["user"]}'
+    who = _who(rec)
     path = _path_str(direction, rec)
-    color = C_OUT if direction == "outbound" else C_IN
-    dlabel = "OUT" if direction == "outbound" else "IN "
+    out_dir = direction == "outbound"
+    color = C_OUT if out_dir else C_IN
+    udp = rec.get("proto") == "udp"
+    dlabel = ("OUT" if out_dir else "IN ") if not udp else ("UDP" if out_dir else "UDP<")
     host = ""
-    if direction == "outbound" and rec.get("host_guess"):
+    if out_dir and rec.get("host_guess"):
         host = f' ({rec["host_guess"]}, {rec["host_guess_source"]})'
-    if evt == "open":
+    if evt == "dns":
+        ans = ",".join(rec.get("dns_answers") or [])
+        bad = rec.get("dns_rcode") != "NOERROR"
+        line = (f'{C_DIM}{t}{C_RESET} {C_DNS}{"DNS" if out_dir else "DNS<"}{C_RESET} {who}  '
+                f'{rec.get("dns_type")} {rec.get("dns_name")}')
+        if ans:
+            line += f' => {ans}'
+        line += f'  {C_RED if bad else ""}{rec.get("dns_rcode")}{C_RESET}'
+        if rec.get("dns_ms") is not None:
+            line += f' {human_dur(rec["dns_ms"])}'
+        line += f'  {C_DIM}via {rec["remote_ip"] if out_dir else rec["local_ip"]}{C_RESET}'
+    elif evt == "open":
         line = f'{C_DIM}{t}{C_RESET} {color}{dlabel}{C_RESET} {who}  {path}{host}'
     elif evt == "close":
         bad = rec.get("outcome") == "failed"
@@ -1236,6 +1500,8 @@ def live_print(direction, rec):
                 f'rx={human_bytes(rec.get("bytes_rx"))} {out_col}outcome={rec.get("outcome")}{C_RESET}')
     else:
         line = f'{C_DIM}{t} {dlabel.strip()}-REPEAT{C_RESET} {who}  {path}  repeated={rec.get("count")}'
+        if rec.get("dns_name"):
+            line += f' {rec.get("dns_type")} {rec.get("dns_name")}'
     if ARGS.show_cmd and not ARGS.no_cmd and rec.get("cmdline"):
         line += f'  {C_DIM}| {rec["cmdline"][:120]}{C_RESET}'
     print(line, flush=True)
@@ -1247,16 +1513,40 @@ def emit(direction, rec):
 
 
 # ------------------------------------------------------------- olay hatti
+# Tum olaylar (BPF + DNS paketleri) OLAY ZAMANINA gore siralanip LAG_S sonra islenir; boylece
+# farkli perf tamponlari ile paket soketi arasindaki gecikme farklari sirayi bozmaz.
+LAG_S = 0.3
+POLL_MS = 100
+PENDING = []              # heap: (duvar saati, sira no, tur, yuk)
+_SEQ = 0
+
+FLOW_TTL = 120.0
+FLOWS = OrderedDict()     # (istemci portu, cozucu ham adresi) -> (zaman, pid, uid, comm)
+FLOWS_MAX = 20000
+
+
 def event_wall(ts_us):
     """BPF (CLOCK_MONOTONIC) zamanini duvar saatine cevirir."""
     return time.time() - (time.monotonic() - ts_us / 1e6)
 
 
-def build_rec(event, wall, direction, family, lip, lport, rip, rport, pid, uid, comm, info):
+def enqueue_wall(kind, wall, payload):
+    global _SEQ
+    _SEQ += 1
+    heapq.heappush(PENDING, (wall, _SEQ, kind, payload))
+
+
+def enqueue(kind, ts_us, payload):
+    """Geri cagirimlar yalnizca kuyruga ekler; isleme poll'den sonra, olay zamanina gore yapilir."""
+    enqueue_wall(kind, event_wall(ts_us), payload)
+
+
+def build_rec(event, wall, direction, family, lip, lport, rip, rport, pid, uid, comm, info, proto="tcp"):
     return {
         "ts": datetime.fromtimestamp(wall, timezone.utc).isoformat(),
         "hostname": HOSTNAME,
         "event": event,
+        "proto": proto,
         "uid": uid,
         "user": get_username(uid),
         "pid": pid,
@@ -1280,23 +1570,436 @@ def _comm_str(raw):
     return sanitize(bytes(raw).split(b"\x00", 1)[0].decode(errors="replace"))
 
 
-PENDING = []
-_SEQ = 0
+def remember_flow(sport, raddr, wall, pid, uid, comm):
+    key = (sport, raddr)
+    FLOWS[key] = (wall, pid, uid, comm)
+    FLOWS.move_to_end(key)
+    while len(FLOWS) > FLOWS_MAX:
+        FLOWS.popitem(last=False)
 
 
-def enqueue(kind, ts_us, payload):
-    """Geri cagirimlar yalnizca kuyruga ekler; isleme poll'den sonra, BPF zamanina gore siralanarak yapilir.
-    Boylece farkli perf tamponlarindan gelen host/acilis/kapanis olaylari dogru sirada eslesir."""
-    global _SEQ
-    _SEQ += 1
-    PENDING.append((ts_us, _SEQ, kind, payload))
+# ------------------------------------------------------------- DNS ayristirma
+DNS_QTYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA",
+              33: "SRV", 35: "NAPTR", 43: "DS", 46: "RRSIG", 48: "DNSKEY", 50: "NSEC3", 52: "TLSA",
+              64: "SVCB", 65: "HTTPS", 99: "SPF", 255: "ANY", 257: "CAA"}
+DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
 
 
-def do_host(ts_us, p):
-    remember_host(p["pid"], p["host"], p["source"], ts_us / 1e6)
+def _dns_label(raw):
+    """Etiket baytlari -> guvenli ASCII (nokta, ters bolu ve yazdirilamayanlar \\DDD ile kacirilir)."""
+    out = []
+    for c in raw:
+        if c in (0x2E, 0x5C):
+            out.append("\\" + chr(c))
+        elif 0x21 <= c <= 0x7E:
+            out.append(chr(c))
+        else:
+            out.append("\\%03d" % c)
+    return "".join(out)
 
 
-def do_open(ts_us, p):
+def _dns_name(buf, off):
+    """Sikistirma isaretcilerini de cozer. Gecersiz/dongulu/asiri uzunsa ValueError."""
+    labels, end, hops, total, n = [], None, 0, 0, len(buf)
+    while True:
+        if off >= n:
+            raise ValueError("kisa paket")
+        ln = buf[off]
+        if ln == 0:
+            off += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= n:
+                raise ValueError("kisa isaretci")
+            ptr = ((ln & 0x3F) << 8) | buf[off + 1]
+            if end is None:
+                end = off + 2
+            hops += 1
+            if hops > 16 or ptr >= n:
+                raise ValueError("isaretci dongusu")
+            off = ptr
+            continue
+        if ln & 0xC0:
+            raise ValueError("gecersiz etiket")
+        off += 1
+        if off + ln > n:
+            raise ValueError("kisa etiket")
+        total += ln + 1
+        if total > 255:
+            raise ValueError("ad cok uzun")
+        labels.append(_dns_label(buf[off:off + ln]))
+        off += ln
+    if end is None:
+        end = off
+    return (".".join(labels).lower() or "."), end
+
+
+def parse_dns(buf):
+    """DNS mesaji -> sozluk (id, qr, rcode, tc, qname, qtype, answers[(tur, deger)]) ya da None."""
+    if len(buf) < 12:
+        return None
+    tid, flags, qd, an = struct.unpack("!HHHH", buf[:8])
+    if (flags >> 11) & 0xF != 0 or qd < 1 or qd > 8:      # yalnizca standart sorgu/yanit
+        return None
+    qr = (flags >> 15) & 1
+    try:
+        qname, off = _dns_name(buf, 12)
+        if off + 4 > len(buf):
+            return None
+        qtype = struct.unpack("!H", buf[off:off + 2])[0]
+        off += 4
+        for _ in range(qd - 1):                    # ek sorulari atla
+            _n, off = _dns_name(buf, off)
+            off += 4
+    except ValueError:
+        return None
+    answers = []
+    if qr:
+        try:
+            for _ in range(min(an, 64)):
+                _n, off = _dns_name(buf, off)
+                if off + 10 > len(buf):
+                    break
+                rtype, _rc, _ttl, rdlen = struct.unpack("!HHIH", buf[off:off + 10])
+                off += 10
+                if off + rdlen > len(buf):
+                    break
+                if rtype == 1 and rdlen == 4:
+                    answers.append(("A", socket.inet_ntop(socket.AF_INET, buf[off:off + 4])))
+                elif rtype == 28 and rdlen == 16:
+                    answers.append(("AAAA", socket.inet_ntop(socket.AF_INET6, buf[off:off + 16])))
+                elif rtype == 5:
+                    try:
+                        answers.append(("CNAME", _dns_name(buf, off)[0]))
+                    except ValueError:
+                        pass
+                off += rdlen
+        except ValueError:
+            pass                                   # eldekini koru
+    return {"id": tid, "qr": qr, "rcode": flags & 0xF, "tc": bool((flags >> 9) & 1),
+            "qname": qname, "qtype": qtype, "answers": answers}
+
+
+# ------------------------------------------------------------- yerel adresler / IP-UDP ayristirma
+LOCAL_ADDRS = set()       # ham baytlar (4 veya 16)
+_LOCAL_AT = 0.0
+
+
+def refresh_local_addrs(force=False):
+    """Bu makinenin (ana ag ad alani) adreslerini /proc/net/fib_trie ve if_inet6'dan okur; 30 sn'de bir."""
+    global _LOCAL_AT, LOCAL_ADDRS
+    now = time.monotonic()
+    if not force and now - _LOCAL_AT < 30.0:
+        return
+    _LOCAL_AT = now
+    s = set()
+    try:
+        last = None
+        with open("/proc/net/fib_trie", "r", encoding="ascii", errors="replace") as f:
+            for ln in f:
+                t = ln.strip()
+                if t.startswith("|--"):
+                    last = t[3:].strip()
+                elif t.startswith("/32 host LOCAL") and last:
+                    try:
+                        s.add(socket.inet_aton(last))
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    try:
+        with open("/proc/net/if_inet6", "r", encoding="ascii", errors="replace") as f:
+            for ln in f:
+                parts = ln.split()
+                if parts and len(parts[0]) == 32:
+                    try:
+                        s.add(bytes.fromhex(parts[0]))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    LOCAL_ADDRS = s
+
+
+def is_local(raw):
+    if raw in LOCAL_ADDRS:
+        return True
+    if len(raw) == 4:
+        return raw[0] == 127
+    return raw == b"\x00" * 15 + b"\x01"
+
+
+def ip_text(raw):
+    return socket.inet_ntop(socket.AF_INET if len(raw) == 4 else socket.AF_INET6, raw)
+
+
+def _norm_addr(raw):
+    if len(raw) == 16 and raw[:12] == b"\x00" * 10 + b"\xff\xff":
+        return raw[12:]
+    return raw
+
+
+def parse_ip_udp(pkt):
+    """Ag katmani paketi (IPv4/IPv6) -> UDP ozeti ya da None. Parcalarin yalniz ilkini kabul eder."""
+    n = len(pkt)
+    if n < 20:
+        return None
+    ver = pkt[0] >> 4
+    if ver == 4:
+        ihl = (pkt[0] & 0x0F) * 4
+        if ihl < 20 or n < ihl + 8 or pkt[9] != 17:
+            return None
+        if struct.unpack("!H", pkt[6:8])[0] & 0x1FFF:
+            return None
+        src, dst, off = pkt[12:16], pkt[16:20], ihl
+    elif ver == 6:
+        if n < 48 or pkt[6] != 17:
+            return None
+        src, dst, off = _norm_addr(pkt[8:24]), _norm_addr(pkt[24:40]), 40
+    else:
+        return None
+    sport, dport, ulen = struct.unpack("!HHH", pkt[off:off + 6])
+    if ulen < 8:
+        return None
+    return {"src": src, "dst": dst, "sport": sport, "dport": dport, "payload": pkt[off + 8:off + ulen]}
+
+
+# ------------------------------------------------------------- DNS paket yakalama (AF_PACKET + klasik BPF)
+SO_ATTACH_FILTER = 26
+SO_RCVBUFFORCE = 33
+SO_TIMESTAMPNS_OPT = getattr(socket, "SO_TIMESTAMPNS", 35)
+PKT_SOCK = None
+_PKT_ERR_WARNED = False
+
+
+class SockFilter(ct.Structure):
+    _fields_ = [("code", ct.c_ushort), ("jt", ct.c_ubyte), ("jf", ct.c_ubyte), ("k", ct.c_uint)]
+
+
+class SockFprog(ct.Structure):
+    _fields_ = [("len", ct.c_ushort), ("filter", ct.POINTER(SockFilter))]
+
+
+_LDB_ABS, _LDH_ABS, _LDH_IND, _LDXB_MSH = 0x30, 0x28, 0x48, 0xB1
+_AND_K, _JEQ_K, _JSET_K, _RET_K = 0x54, 0x15, 0x45, 0x06
+
+
+def dns_bpf_program():
+    """Klasik BPF: IPv4/IPv6 UDP, kaynak veya hedef port 53 (parcalanmis paketlerin ilki dahil). Paket ag
+    katmanindan baslar (SOCK_DGRAM). Etiketler (str) atlama hedefidir."""
+    prog = [
+        (_LDB_ABS, 0, 0, 0),
+        (_AND_K, 0, 0, 0xF0),
+        (_JEQ_K, "v4", "chk6", 0x40),
+        "v4",
+        (_LDB_ABS, 0, 0, 9),
+        (_JEQ_K, "v4a", "rej", 17),
+        "v4a",
+        (_LDH_ABS, 0, 0, 6),
+        (_JSET_K, "rej", "v4b", 0x1FFF),
+        "v4b",
+        (_LDXB_MSH, 0, 0, 0),
+        (_LDH_IND, 0, 0, 0),
+        (_JEQ_K, "acc", "v4c", 53),
+        "v4c",
+        (_LDH_IND, 0, 0, 2),
+        (_JEQ_K, "acc", "rej", 53),
+        "chk6",
+        (_JEQ_K, "v6", "rej", 0x60),
+        "v6",
+        (_LDB_ABS, 0, 0, 6),
+        (_JEQ_K, "v6a", "rej", 17),
+        "v6a",
+        (_LDH_ABS, 0, 0, 40),
+        (_JEQ_K, "acc", "v6b", 53),
+        "v6b",
+        (_LDH_ABS, 0, 0, 42),
+        (_JEQ_K, "acc", "rej", 53),
+        "acc",
+        (_RET_K, 0, 0, 0x40000),
+        "rej",
+        (_RET_K, 0, 0, 0),
+    ]
+    labels, insns = {}, []
+    for item in prog:
+        if isinstance(item, str):
+            labels[item] = len(insns)
+        else:
+            insns.append(item)
+    out = []
+    for i, (op, jt, jf, k) in enumerate(insns):
+        jt = labels[jt] - i - 1 if isinstance(jt, str) else jt
+        jf = labels[jf] - i - 1 if isinstance(jf, str) else jf
+        out.append((op, jt, jf, k))
+    return out
+
+
+def open_dns_socket():
+    """Tum arayuzlerde 53/udp paketlerini alan, bloklamayan AF_PACKET soketi (root gerekir)."""
+    # Not: bind(("", proto)) Python 3.13'te ENODEV verir; bu yuzden bind yok. ETH_P_ALL ile olusturulan
+    # baglanmamis AF_PACKET soketi tum arayuzlerden alir. Suzgec takilana kadar gelebilecek birkac
+    # fazla paketi drain_packets/parse_ip_udp zaten eler.
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0003))
+    try:
+        insns = dns_bpf_program()
+        arr = (SockFilter * len(insns))(*[SockFilter(*i) for i in insns])
+        s.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, bytes(SockFprog(len(insns), arr)))
+        for opt in (SO_RCVBUFFORCE, socket.SO_RCVBUF):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, opt, 4 * 1024 * 1024)
+                break
+            except OSError:
+                continue
+        try:
+            s.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS_OPT, 1)
+        except OSError:
+            pass
+        s.setblocking(False)
+    except Exception:
+        s.close()
+        raise
+    return s
+
+
+def drain_packets(limit=4000):
+    global _PKT_ERR_WARNED
+    if PKT_SOCK is None:
+        return
+    for _ in range(limit):
+        try:
+            data, anc, _flags, addr = PKT_SOCK.recvmsg(8192, socket.CMSG_SPACE(16))
+        except (BlockingIOError, InterruptedError):
+            break
+        except OSError as e:
+            if not _PKT_ERR_WARNED:
+                _PKT_ERR_WARNED = True
+                warn(f"DNS paket soketi okuma hatasi: {e}")
+            break
+        pkttype = addr[2] if isinstance(addr, tuple) and len(addr) > 2 else 0
+        if pkttype not in (0, 4):             # yalnizca bize gelen (HOST) ve bizden giden (OUTGOING)
+            continue
+        wall = None
+        for level, ctype, cdata in anc:
+            if level == socket.SOL_SOCKET and ctype == SO_TIMESTAMPNS_OPT:
+                if len(cdata) >= 16:
+                    sec, nsec = struct.unpack("@qq", cdata[:16])
+                elif len(cdata) >= 8:
+                    sec, nsec = struct.unpack("@ii", cdata[:8])
+                else:
+                    continue
+                wall = sec + nsec / 1e9
+        if wall is None:
+            wall = time.time()
+        parsed = parse_ip_udp(data)
+        if parsed is not None and (parsed["sport"] == 53 or parsed["dport"] == 53):
+            enqueue_wall("pkt", wall, parsed)
+
+
+# ------------------------------------------------------------- DNS islemleri
+DNS_TIMEOUT = 5.0
+DNS_PENDING = OrderedDict()       # (istemci, istemci portu, sunucu, id) -> sorgu
+DNS_PENDING_MAX = 20000
+DNS_SEEN = OrderedDict()          # ayni paketin birden cok arayuzde gorunmesine karsi
+
+
+def _new_txn(wall, client, cport, server, msg):
+    local_c, local_s = is_local(client), is_local(server)
+    if not (local_c or local_s):
+        return None                   # bu makinenin ucu olmayan (yonlendirilen) trafik
+    direction = "outbound" if local_c else "inbound"
+    flow = None
+    if direction == "outbound":
+        flow = FLOWS.get((cport, server))
+        if flow is not None and abs(wall - flow[0]) > FLOW_TTL:
+            flow = None
+    return {"wall": wall, "client": client, "cport": cport, "server": server, "direction": direction,
+            "flow": flow, "qname": msg["qname"], "qtype": msg["qtype"]}
+
+
+def emit_dns(txn, rcode_str, answers, tc, ms):
+    flow = txn["flow"]
+    pid, uid, comm = (flow[1], flow[2], flow[3]) if flow else (0, None, "-")
+    direction = txn["direction"]
+    family = "ipv4" if len(txn["server"]) == 4 else "ipv6"
+    cip, sip = ip_text(txn["client"]), ip_text(txn["server"])
+    if direction == "outbound":
+        lip, lport, rip, rport = cip, txn["cport"], sip, 53
+    else:
+        lip, lport, rip, rport = sip, 53, cip, txn["cport"]
+    info = get_proc_info(pid) if pid else {}
+    rec = build_rec("dns", txn["wall"], direction, family, lip, lport, rip, rport,
+                    pid, uid, comm, info, proto="udp")
+    rec["dns_name"] = txn["qname"]
+    rec["dns_type"] = DNS_QTYPES.get(txn["qtype"], f"TYPE{txn['qtype']}")
+    rec["dns_rcode"] = rcode_str
+    rec["dns_answers"] = [(v if t in ("A", "AAAA") else f"CNAME:{v}") for t, v in answers[:16]]
+    rec["dns_ms"] = None if ms is None else round(ms, 3)
+    rec["dns_tc"] = bool(tc)
+    for t, v in answers:
+        if t in ("A", "AAAA"):
+            remember_dns_answer(pid if direction == "outbound" else 0, v, txn["qname"], txn["wall"])
+    if decide(direction, rec, txn["wall"], True) == "log":
+        emit(direction, rec)
+
+
+def dns_expire(cutoff):
+    while DNS_PENDING:
+        _key, txn = next(iter(DNS_PENDING.items()))
+        if txn["wall"] + DNS_TIMEOUT > cutoff:
+            break
+        DNS_PENDING.popitem(last=False)
+        emit_dns(txn, "timeout", [], False, None)
+
+
+def do_pkt(wall, p):
+    msg = parse_dns(p["payload"])
+    if msg is None:
+        return
+    src, dst, sport, dport = p["src"], p["dst"], p["sport"], p["dport"]
+    if msg["qr"]:
+        if sport != 53:
+            return
+        client, cport, server = dst, dport, src
+    else:
+        if dport != 53:
+            return
+        client, cport, server = src, sport, dst
+    dkey = (src, sport, dst, dport, msg["id"], msg["qr"], hash(p["payload"]))
+    seen = DNS_SEEN.get(dkey)
+    if seen is not None and abs(wall - seen) < 1.5:
+        return
+    DNS_SEEN[dkey] = wall
+    DNS_SEEN.move_to_end(dkey)
+    while DNS_SEEN and (len(DNS_SEEN) > 20000 or wall - next(iter(DNS_SEEN.values())) > 5.0):
+        DNS_SEEN.popitem(last=False)
+    txkey = (client, cport, server, msg["id"])
+    if not msg["qr"]:
+        txn = _new_txn(wall, client, cport, server, msg)
+        if txn is None:
+            return
+        DNS_PENDING[txkey] = txn
+        DNS_PENDING.move_to_end(txkey)
+        while len(DNS_PENDING) > DNS_PENDING_MAX:
+            DNS_PENDING.popitem(last=False)
+        return
+    txn = DNS_PENDING.get(txkey)
+    ms = None
+    if txn is not None and txn["qname"] == msg["qname"] and txn["qtype"] == msg["qtype"]:
+        DNS_PENDING.pop(txkey, None)
+        ms = max(0.0, (wall - txn["wall"]) * 1000.0)
+    else:
+        txn = _new_txn(wall, client, cport, server, msg)     # sorgu kacmis (yakalama oncesi)
+        if txn is None:
+            return
+    emit_dns(txn, DNS_RCODES.get(msg["rcode"], f"RCODE{msg['rcode']}"), msg["answers"], msg["tc"], ms)
+
+
+# ------------------------------------------------------------- olay isleyicileri
+def do_host(wall, p):
+    remember_host(p["pid"], p["host"], p["source"], wall)
+
+
+def do_open(wall, p):
     direction, family = p["direction"], p["family"]
     if family == "ipv4":
         lip, rip = ip4_to_str(p["saddr"]), ip4_to_str(p["daddr"])
@@ -1304,22 +2007,22 @@ def do_open(ts_us, p):
         lip, rip = ip6_to_str(p["saddr"]), ip6_to_str(p["daddr"])
     pid = p["pid"]
     info = get_proc_info(pid)
-    rec = build_rec("open", event_wall(ts_us), direction, family, lip, p["sport"], rip, p["dport"],
+    rec = build_rec("open", wall, direction, family, lip, p["sport"], rip, p["dport"],
                     pid, p["uid"], _comm_str(p["comm"]), info)
     host = src = None
     if direction == "outbound":
-        host, src = get_host_for_pid(pid, ts_us / 1e6)
+        host, src = resolve_host(pid, rip, wall)
         if host:
             rec["host_guess"] = host
             rec["host_guess_source"] = src
-    decision = decide(direction, rec, ts_us / 1e6, True)
+    decision = decide(direction, rec, wall, True)
     if LIFECYCLE_ON:
         track_put(p["sk"], decision, host, src, info)
     if decision == "log":
         emit(direction, rec)
 
 
-def do_close(ts_us, p):
+def do_close(wall, p):
     direction = "outbound" if p["dir"] == 1 else "inbound"
     if p["family"] == 2:
         family = "ipv4"
@@ -1330,7 +2033,7 @@ def do_close(ts_us, p):
         lip, rip = ip6_to_str(p["saddr"]), ip6_to_str(p["daddr"])
     ent = TRACK.pop(p["sk"], None)
     info = ent[3] if ent is not None else {}
-    rec = build_rec("close", event_wall(ts_us), direction, family, lip, p["sport"], rip, p["dport"],
+    rec = build_rec("close", wall, direction, family, lip, p["sport"], rip, p["dport"],
                     p["pid"], p["uid"], _comm_str(p["comm"]), info)
     if ent is not None:
         decision, host, src = ent[0], ent[1], ent[2]
@@ -1338,7 +2041,7 @@ def do_close(ts_us, p):
             rec["host_guess"] = host
             rec["host_guess_source"] = src
     else:
-        decision = decide(direction, rec, ts_us / 1e6, False)
+        decision = decide(direction, rec, wall, False)
     if decision != "log":
         return
     rec["duration_ms"] = round(p["dur_us"] / 1000.0, 3)
@@ -1348,21 +2051,47 @@ def do_close(ts_us, p):
     emit(direction, rec)
 
 
-def process_pending():
-    if not PENDING:
-        return
-    batch = sorted(PENDING)
-    PENDING.clear()
-    for ts_us, _, kind, payload in batch:
+def do_udp(wall, p):
+    if p["family"] == 2:
+        af, family, n = socket.AF_INET, "ipv4", 4
+    else:
+        af, family, n = socket.AF_INET6, "ipv6", 16
+    lraw, rraw = p["saddr"][:n], p["daddr"][:n]
+    lip, rip = socket.inet_ntop(af, lraw), socket.inet_ntop(af, rraw)
+    pid, uid = p["pid"], p["uid"]
+    comm = _comm_str(p["comm"])
+    if p["dport"] == 53:
+        remember_flow(p["sport"], rraw, wall, pid, uid, comm)      # DNS paketlerinin surec eslemesi
+        if DNS_ON:
+            return                                                  # kayit paket yakalamadan gelir
+    info = get_proc_info(pid)
+    rec = build_rec("open", wall, "outbound", family, lip, p["sport"], rip, p["dport"],
+                    pid, uid, comm, info, proto="udp")
+    host, src = resolve_host(pid, rip, wall)
+    if host:
+        rec["host_guess"] = host
+        rec["host_guess_source"] = src
+    if decide("outbound", rec, wall, True) == "log":
+        emit("outbound", rec)
+
+
+HANDLERS = {"host": do_host, "open": do_open, "close": do_close, "udp": do_udp, "pkt": do_pkt}
+
+
+def process_pending(force=False):
+    """LAG_S'den eski olaylari zaman sirasiyla isler. force: hepsini (kapanista)."""
+    cutoff = time.time() - LAG_S
+    while PENDING and (force or PENDING[0][0] <= cutoff):
+        wall, _seq, kind, payload = heapq.heappop(PENDING)
         try:
-            if kind == "host":
-                do_host(ts_us, payload)
-            elif kind == "open":
-                do_open(ts_us, payload)
-            else:
-                do_close(ts_us, payload)
+            HANDLERS[kind](wall, payload)
         except Exception as e:
             print(f"isleme hatasi ({kind}): {e}", file=sys.stderr, flush=True)
+    if not force:
+        try:
+            dns_expire(cutoff)
+        except Exception as e:
+            print(f"isleme hatasi (dns_expire): {e}", file=sys.stderr, flush=True)
 
 
 def make_open_cb(perf_name, direction, family):
@@ -1395,6 +2124,19 @@ def close_cb(cpu, data, size):
         })
     except Exception as e:
         print(f"handler hatasi (close_events): {e}", file=sys.stderr, flush=True)
+
+
+def udp_cb(cpu, data, size):
+    try:
+        ev = b["udp_events"].event(data)
+        enqueue("udp", int(ev.ts_us), {
+            "pid": int(ev.pid), "uid": int(ev.uid),
+            "saddr": bytes(ev.saddr), "daddr": bytes(ev.daddr),
+            "sport": int(ev.sport), "dport": int(ev.dport), "family": int(ev.family),
+            "comm": bytes(ev.comm),
+        })
+    except Exception as e:
+        print(f"handler hatasi (udp_events): {e}", file=sys.stderr, flush=True)
 
 
 def host_cb(cpu, data, size):
@@ -1570,39 +2312,62 @@ def find_libssl():
 
 
 def compile_bpf():
-    """BPF'yi derler; olmazsa daha dar moda duser. Doner: (bpf, yasam_dongusu_acik, bayt_acik)."""
+    """BPF'yi derler; olmazsa daha dar moda duser. Doner: (bpf, yasam_dongusu, bayt, udp_derlendi)."""
+    base = [f"-DUDP_WINDOW_NS={int(ARGS.udp_window * 1e9)}ULL"]
     if ARGS.no_lifecycle:
-        attempts = [(["-DNO_LIFECYCLE"], False, False)]
+        modes = [(["-DNO_LIFECYCLE"], False, False)]
     else:
-        attempts = []
+        modes = []
         if not ARGS.no_bytes:
-            attempts.append(([], True, True))
-        attempts.append((["-DNO_BYTES"], True, False))
-        attempts.append((["-DNO_LIFECYCLE"], False, False))
+            modes.append(([], True, True))
+        modes.append((["-DNO_BYTES"], True, False))
+        modes.append((["-DNO_LIFECYCLE"], False, False))
+    attempts = []
+    for udp in ([True, False] if not ARGS.no_udp else [False]):
+        for flags, life, byt in modes:
+            attempts.append((base + flags + ([] if udp else ["-DNO_UDP"]), life, byt, udp))
     last = None
-    for flags, life, byt in attempts:
+    for i, (flags, life, byt, udp) in enumerate(attempts):
         try:
-            return BPF(text=BPF_PROGRAM, cflags=flags), life, byt
+            return BPF(text=BPF_PROGRAM, cflags=flags), life, byt, udp
         except Exception as e:
             last = e
-            warn(f"BPF derlenemedi/baglanamadi (bayraklar: {' '.join(flags) or 'yok'}): {e}")
-            if flags != attempts[-1][0]:
+            warn(f"BPF derlenemedi/baglanamadi (bayraklar: {' '.join(flags)}): {e}")
+            if i + 1 < len(attempts):
                 warn("daha dar bir mod deneniyor...")
     raise last
 
 
+def attach_udp():
+    """UDP kprobe'larini baglar. Doner: IPv4 UDP (udp_sendmsg) baglandi mi."""
+    try:
+        b.attach_kprobe(event="udp_sendmsg", fn_name="trace_udp_sendmsg")
+        b.attach_kretprobe(event="udp_sendmsg", fn_name="trace_udp_sendmsg_ret")
+    except Exception as e:
+        warn(f"udp_sendmsg probe eklenemedi ({e}); UDP akislari ve DNS surec eslemesi kapali.")
+        return False
+    try:
+        b.attach_kprobe(event="udpv6_sendmsg", fn_name="trace_udpv6_sendmsg")
+        b.attach_kretprobe(event="udpv6_sendmsg", fn_name="trace_udp_sendmsg_ret")
+    except Exception as e:
+        warn(f"udpv6_sendmsg probe eklenemedi ({e}); IPv6 UDP izlenmiyor.")
+    return True
+
+
 # ---------------------------------------------------------------------- main
 def main():
-    global b, LIFECYCLE_ON, BYTES_ON
+    global b, LIFECYCLE_ON, BYTES_ON, UDP_ON, DNS_ON, PKT_SOCK
     print_banner()
     LOGGERS["outbound"] = make_logger("sniper.outbound", OUT_LOG)
     LOGGERS["inbound"] = make_logger("sniper.inbound", IN_LOG)
 
-    b, LIFECYCLE_ON, BYTES_ON = compile_bpf()
+    b, LIFECYCLE_ON, BYTES_ON, udp_compiled = compile_bpf()
     if not LIFECYCLE_ON and not ARGS.no_lifecycle:
         warn("yasam dongusu (close kaydi) kapali: tracepoint sock:inet_sock_set_state kullanilamadi.")
     elif LIFECYCLE_ON and not BYTES_ON and not ARGS.no_bytes:
         warn("bayt sayaclari okunamadi (cekirdek < 4.19?); close kayitlarinda bytes_tx/bytes_rx bos olacak.")
+    if not udp_compiled and not ARGS.no_udp:
+        warn("UDP bolumu derlenemedi; UDP akislari ve DNS surec eslemesi kapali.")
 
     for sym in ("tcp_v4_connect", "tcp_v6_connect"):
         b.attach_kprobe(event=sym, fn_name="trace_connect_entry")
@@ -1627,6 +2392,8 @@ def main():
         else:
             warn("libssl bulunamadi; SNI probe atlandi, host_guess yalnizca dns olacak.")
 
+    UDP_ON = attach_udp() if udp_compiled else False
+
     pages = ARGS.perf_pages
     for name, direction, family in (
         ("ipv4_out_events", "outbound", "ipv4"),
@@ -1639,6 +2406,18 @@ def main():
     b["host_events"].open_perf_buffer(host_cb, page_cnt=pages, lost_cb=make_lost_cb("host_events"))
     if LIFECYCLE_ON:
         b["close_events"].open_perf_buffer(close_cb, page_cnt=pages, lost_cb=make_lost_cb("close_events"))
+    if UDP_ON:
+        b["udp_events"].open_perf_buffer(udp_cb, page_cnt=pages, lost_cb=make_lost_cb("udp_events"))
+
+    if not ARGS.no_dns:
+        try:
+            PKT_SOCK = open_dns_socket()
+            DNS_ON = True
+        except Exception as e:
+            warn(f"DNS paket yakalama baslatilamadi ({e}); DNS kayitlari kapali.")
+        if DNS_ON and not UDP_ON:
+            warn("UDP akis olaylari yok: DNS kayitlarinda surec (pid/comm) bilinmeyecek.")
+    refresh_local_addrs(force=True)
 
     print(f"sniper v{VERSION} basladi (monitor-only, format={ARGS.format}).", flush=True)
     print(f"  giden : {OUT_LOG}", flush=True)
@@ -1648,9 +2427,13 @@ def main():
         print(f"  csv   : ayirac='{d}' bom={ARGS.csv_bom} excel-safe={ARGS.csv_excel_safe}", flush=True)
     print(f"  cmdline: {'kapali (acmak icin --cmd)' if ARGS.no_cmd else 'acik'}", flush=True)
     if ENABLE_HOST_ENRICHMENT:
-        print(f"  host_guess kaynaklari: {', '.join(host_sources) if host_sources else 'yok'}", flush=True)
+        print(f"  host_guess kaynaklari: {', '.join(host_sources) if host_sources else 'yok'}"
+              f"{' + dns-yaniti' if DNS_ON else ''}", flush=True)
     print(f"  yasam dongusu: {'acik' if LIFECYCLE_ON else 'kapali'}"
           f"{' (bayt sayaclari ' + ('acik' if BYTES_ON else 'kapali') + ')' if LIFECYCLE_ON else ''}", flush=True)
+    print(f"  udp: {'acik (pencere ' + format(ARGS.udp_window, 'g') + ' sn)' if UDP_ON else 'kapali'}"
+          f" | dns: {'acik (AF_PACKET 53/udp, yerel adres: ' + str(len(LOCAL_ADDRS)) + ')' if DNS_ON else 'kapali'}",
+          flush=True)
     print(f"  zenginlestirme: {'acik' if ENRICH else 'kapali'} | kurallar: {len(RULES)} "
           f"(varsayilan: {RULES_DEFAULT}) | dedupe: {ARGS.dedupe or 'kapali'}", flush=True)
     print(f"  perf-pages: {pages}", flush=True)
@@ -1664,15 +2447,18 @@ def main():
 
     try:
         while True:
-            b.perf_buffer_poll(timeout=1000)
+            b.perf_buffer_poll(timeout=POLL_MS)
+            drain_packets()
             process_pending()
             flush_dedupe()
+            refresh_local_addrs()
             report_lost()
     except KeyboardInterrupt:
         pass
     finally:
         try:
-            process_pending()
+            drain_packets()
+            process_pending(force=True)
             flush_dedupe(force=True)
         except Exception as e:
             print(f"kapanista isleme hatasi: {e}", file=sys.stderr, flush=True)
